@@ -21,6 +21,15 @@ python3 examples/walkthrough.py --workflow all
 
 该命令启动临时实例，执行 14 条真实生产入口工作流，输出逐条观测 JSON，最后关闭实例并删除本次临时目录。可用 `--workflow query-plan` 等方式只运行一条。它是有界运行演示，不是基线测试套件。测试代码和自动化测试基础设施有意留待后续工作，本基线 `testing=deferred`。
 
+空值排序另有两条独立的有界观测脚本，均只使用公开 HTTP 接口，并以索引/全扫差分和独立 Python 模型交叉核对：
+
+```sh
+python3 examples/nulls_ordering_check.py   # 建索引、更新、删除、回收、重启与历史读交错
+python3 examples/nulls_ordering_fuzz.py    # 固定种子随机写入并逐步差分
+```
+
+它们同样是演示性观测，不替代独立测试套件。
+
 ## 一个事务
 
 所有业务接口前缀为 `/v1/lamina`，JSON 标量仅支持有符号 64 位整数、文本、布尔值和 null。
@@ -48,11 +57,13 @@ curl -s http://127.0.0.1:7386/v1/lamina/sql -H 'Content-Type: application/json' 
 {"relation":"spectra","where":[{"column":"amplitude","op":">=","value":20}],"order":[{"column":"amplitude","desc":true}],"limit":10}
 ```
 
-读事务固定开始时的提交序号，重复读稳定，支持读自己的暂存写入。普通读使用当前序号。按 `at` 查询只接受保留区间内的序号，并要求关系在该序号已存在。事务无法访问在它开始之后创建的关系。无显式排序时按类型化主键排序；排序相同时也用主键确定次序。升序 null 在前，降序 null 在后。null 普通比较不匹配；使用 `is_null` 检查。
+读事务固定开始时的提交序号，重复读稳定，支持读自己的暂存写入。普通读使用当前序号。按 `at` 查询只接受保留区间内的序号，并要求关系在该序号已存在。事务无法访问在它开始之后创建的关系。无显式排序时按类型化主键排序；排序相同时也用主键确定次序。null 普通比较不匹配；使用 `is_null` 检查。
+
+排序项可显式选择空值位置：`nulls_first:true` 或 `nulls_last:true`（SQL 写作 `ORDER BY amplitude DESC NULLS FIRST`）。二者与 `desc` 相互独立，因此四种组合都可请求。同时设置两项返回 400。未指定时保持历史约定：升序 null 在前，降序 null 在后，旧请求的行与计划完全不变。无论方向或空值位置如何，最终相同时一律按类型化主键升序确定次序，所以相同排序键的结果唯一且可复现。
 
 数据库提供快照隔离和同键 first-committer-wins，不承诺串行化、谓词锁或跨行写偏差防护。提交前对最终可见状态检查所有受影响关系的唯一索引；一次事务内可以置换唯一值。失败提交会关闭该事务，不发布任何私有行。只读事务通过 `{"read_only":true}` 开始。
 
-SQL 只支持单条 SELECT：投影或 `count(*)`、`count(column)`、`sum(integer_column)`，可选 WHERE AND、ORDER BY、LIMIT。字符串使用单引号，内部单引号写两次；关键字及未引号标识符转为小写。没有 JOIN、GROUP BY、别名、表达式、SQL DDL/DML。语义检查与结构化查询共用绑定和执行。`sum` 忽略 null，空输入返回 null，溢出报错；`count(column)` 忽略 null，`count(*)` 计算全部匹配行。
+SQL 只支持单条 SELECT：投影或 `count(*)`、`count(column)`、`sum(integer_column)`，可选 WHERE AND、ORDER BY（每项可带 `ASC`/`DESC` 与 `NULLS FIRST`/`NULLS LAST`）、LIMIT。字符串使用单引号，内部单引号写两次；关键字及未引号标识符转为小写。没有 JOIN、GROUP BY、别名、表达式、SQL DDL/DML。语义检查与结构化查询共用绑定和执行。`sum` 忽略 null，空输入返回 null，溢出报错；`count(column)` 忽略 null，`count(*)` 计算全部匹配行。
 
 ## 索引
 
@@ -62,7 +73,9 @@ SQL 只支持单条 SELECT：投影或 `count(*)`、`count(column)`、`sum(integ
 {"name":"by_amplitude","relation":"spectra","column":"amplitude","unique":false}
 ```
 
-单列索引由类型化有序切片维护，保留历史非空值到主键的候选关联。唯一约束允许多个 null。索引在当前提交序号同步构建；构建失败不会发布目录。规划器在可用索引中选择候选键最少的一条，之后读取指定快照的真实版本并执行全部谓词。对早于索引创建时刻的查询使用扫描；含私有写入的事务查询也使用扫描。回收后重建历史候选。
+单列索引由类型化有序切片维护，保留历史值到主键的候选关联；null 关联单独保存，因此有序访问仍能看到排序值为 null 的行，但普通比较的候选范围永远不含 null。唯一约束允许多个 null。索引在当前提交序号同步构建；构建失败不会发布目录。规划器在可用索引中选择候选键最少的一条，之后读取指定快照的真实版本并执行全部谓词。对早于索引创建时刻的查询使用扫描；含私有写入的事务查询也使用扫描。回收后重建历史候选。
+
+索引只有一种物理次序：值升序、主键升序，null 单独成块。`desc`、`nulls_first`、`nulls_last` 都是读取时的遍历参数，不重写索引，所以同一份候选结构既服务历史快照，也服务当前快照。显式请求空值位置且排序列为单列索引时，规划器可直接按索引次序遍历可见行，无需物化全部匹配行再排序；`plan.ordered` 表示走了这条路径。候选遍历仍对每个键读取目标快照的真实版本并复核值，因此更新或删除不会让旧关联返回错误行；完整可见行集合与全扫一致。未显式指定空值位置的旧请求继续使用原有访问路径与排序，结果不变。
 
 结果的 `plan.candidates` 是访问路径候选键数，`scanned` 是存在可见行并进入残余判断的行数，`matched` 是限制输出前的匹配数。保留历史候选可能导致这些数字差异很大。`force_scan:true` 可用于对照观测。`plan` 是执行事实，不是 I/O 耗时估计。
 

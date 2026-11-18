@@ -175,7 +175,18 @@ func (p *parser) selectQuery() (query.Request, error) {
 			if !desc {
 				p.accept("asc")
 			}
-			q.Order = append(q.Order, query.Ordering{Column: column, Desc: desc})
+			ordering := query.Ordering{Column: column, Desc: desc}
+			if p.accept("nulls") {
+				switch {
+				case p.accept("first"):
+					ordering.NullsFirst = true
+				case p.accept("last"):
+					ordering.NullsLast = true
+				default:
+					return q, p.error("first or last")
+				}
+			}
+			q.Order = append(q.Order, ordering)
 			if !p.accept(",") {
 				break
 			}

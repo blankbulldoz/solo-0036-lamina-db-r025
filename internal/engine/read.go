@@ -1,7 +1,9 @@
 package engine
 
 import (
+	"lamina/internal/catalog"
 	"lamina/internal/datum"
+	"lamina/internal/index"
 	"lamina/internal/query"
 )
 
@@ -42,6 +44,9 @@ func (d *DB) Query(q query.Request) (query.Result, error) {
 		q.ForceScan = true
 	}
 	plan, keys := query.Choose(d.catalog, d.indexes, q, at, len(d.store.Tables[q.Relation]))
+	if plan.Ordered {
+		keys = d.orderedCandidates(r, d.indexes.Trees[plan.Index], plan, at)
+	}
 	rows := map[string]datum.Row{}
 	if plan.Access == "index" {
 		for _, key := range keys {
@@ -61,6 +66,38 @@ func (d *DB) Query(q query.Request) (query.Result, error) {
 		return result, invalid(err)
 	}
 	return result, nil
+}
+
+// orderedCandidates produces primary keys in presentation order for a single
+// ordering key backed by an index. The tree is walked in its canonical order;
+// each association is re-interpreted against the requested snapshot, so only a
+// key whose visible row actually carries that value is emitted, exactly once.
+// Historical associations that no longer describe the visible row are skipped,
+// which is why an append-only index can serve both old and new snapshots with
+// the same physical order. Null placement is applied by walking the null block
+// before or after the non-null values; the tree itself is never reordered.
+func (d *DB) orderedCandidates(r catalog.Relation, tree *index.Tree, plan query.Plan, at uint64) []string {
+	column := plan.OrderColumn
+	out := make([]string, 0, plan.Candidates)
+	seen := map[string]bool{}
+	visit := func(e index.Entry) bool {
+		if seen[e.Key] {
+			return true
+		}
+		row, visible := d.store.Read(r.Name, e.Key, at)
+		if !visible || row[column].Key() != e.Value.Key() {
+			return true
+		}
+		seen[e.Key] = true
+		out = append(out, e.Key)
+		return true
+	}
+	if plan.RangeOp == "" {
+		tree.Ordered(plan.OrderDesc, plan.NullsFirst, visit)
+	} else {
+		tree.OrderedRange(plan.RangeOp, plan.RangeValue, plan.OrderDesc, visit)
+	}
+	return out
 }
 func (d *DB) Get(id, table string, key datum.Value) (datum.Row, error) {
 	q := query.Request{Relation: table, Transaction: id, Limit: 1}

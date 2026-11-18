@@ -25,6 +25,9 @@ func Bind(r catalog.Relation, q Request) error {
 		if _, ok := r.Column(o.Column); !ok {
 			return fmt.Errorf("unknown ordering %s", o.Column)
 		}
+		if o.NullsFirst && o.NullsLast {
+			return fmt.Errorf("ordering %s cannot request both nulls_first and nulls_last", o.Column)
+		}
 	}
 	for _, p := range q.Where {
 		c, ok := r.Column(p.Column)
